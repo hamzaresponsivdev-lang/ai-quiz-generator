@@ -37,6 +37,47 @@ function isValidQuiz(quiz) {
   );
 }
 
+// Fast models first; later entries are fallbacks if a model is overloaded.
+const MODELS = [
+  process.env.GEMINI_MODEL,
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-3.5-flash",
+].filter((model, idx, list) => model && list.indexOf(model) === idx);
+
+// Keep the whole request well under the serverless function time limit.
+const ATTEMPT_TIMEOUT_MS = 12000;
+const TOTAL_BUDGET_MS = 22000;
+
+function getClients() {
+  const clients = [];
+
+  // A Gemini key may be set manually or injected by Netlify AI Gateway.
+  if (process.env.GEMINI_API_KEY) {
+    const baseUrl = process.env.GOOGLE_GEMINI_BASE_URL;
+    clients.push(
+      new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY,
+        ...(baseUrl ? { httpOptions: { baseUrl } } : {}),
+      }),
+    );
+  }
+
+  // The AI Gateway credentials are always available on Netlify.
+  if (process.env.NETLIFY_AI_GATEWAY_KEY) {
+    clients.push(
+      new GoogleGenAI({
+        apiKey: process.env.NETLIFY_AI_GATEWAY_KEY,
+        httpOptions: {
+          baseUrl: process.env.NETLIFY_AI_GATEWAY_BASE_URL?.replace(/\/$/, ""),
+        },
+      }),
+    );
+  }
+
+  return clients;
+}
+
 export async function POST(request) {
   let body;
 
@@ -62,51 +103,66 @@ export async function POST(request) {
     );
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.error("GEMINI_API_KEY is not configured.");
+  const clients = getClients();
+  if (!clients.length) {
+    console.error("No Gemini API key or AI Gateway key is configured.");
     return NextResponse.json(
       { error: "Quiz generation is not configured on the server." },
       { status: 500 },
     );
   }
 
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-      contents: `Create exactly five accurate, engaging multiple-choice quiz questions about: "${topic}". Each question must have exactly four distinct answer options and one correct answer that exactly matches one of those options. Make the questions specific to the topic and suitable for a general learner.`,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: QUIZ_SCHEMA,
-      },
-    });
+  const prompt = `Create exactly five accurate, engaging multiple-choice quiz questions about: "${topic}". Each question must have exactly four distinct answer options and one correct answer that exactly matches one of those options. Make the questions specific to the topic and suitable for a general learner.`;
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
 
-    let quiz;
-    try {
-      quiz = JSON.parse(response.text || "");
-    } catch {
-      console.error("Gemini returned a response that was not valid JSON.");
-      return NextResponse.json(
-        { error: "The AI returned an invalid quiz. Please try again." },
-        { status: 502 },
-      );
+  for (const model of MODELS) {
+    for (const ai of clients) {
+      const remaining = deadline - Date.now();
+      if (remaining < 2000) break;
+
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: QUIZ_SCHEMA,
+            httpOptions: {
+              timeout: Math.min(ATTEMPT_TIMEOUT_MS, remaining),
+              retryOptions: { attempts: 1 },
+            },
+          },
+        });
+
+        let quiz;
+        try {
+          quiz = JSON.parse(response.text || "");
+        } catch {
+          console.error(
+            `${model} returned a response that was not valid JSON.`,
+          );
+          continue;
+        }
+
+        if (!isValidQuiz(quiz)) {
+          console.error(
+            `${model} returned quiz data that did not match the schema.`,
+          );
+          continue;
+        }
+
+        return NextResponse.json({ quiz });
+      } catch (error) {
+        console.error(
+          `Gemini quiz generation failed with ${model}:`,
+          error?.message || error,
+        );
+      }
     }
-
-    if (!isValidQuiz(quiz)) {
-      console.error("Gemini returned quiz data that did not match the schema.");
-      return NextResponse.json(
-        { error: "The AI returned an incomplete quiz. Please try again." },
-        { status: 502 },
-      );
-    }
-
-    return NextResponse.json({ quiz });
-  } catch (error) {
-    console.error("Gemini quiz generation failed:", error);
-    return NextResponse.json(
-      { error: "Could not generate a quiz right now. Please try again." },
-      { status: 502 },
-    );
   }
+
+  return NextResponse.json(
+    { error: "Could not generate a quiz right now. Please try again." },
+    { status: 502 },
+  );
 }

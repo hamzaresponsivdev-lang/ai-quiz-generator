@@ -42,7 +42,8 @@ export default function AiQuizApp() {
         body: JSON.stringify({ topic: topic.trim() }),
       });
 
-      const data = await res.json();
+      // The server may return a non-JSON error page (e.g. on a timeout).
+      const data = await res.json().catch(() => ({}));
 
       if (!res.ok) {
         throw new Error(
